@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         链接新标签打开 (Open Links in New Tab)
 // @namespace    https://github.com/fanghaydn
-// @version      2.0.0
+// @version      2.1.0
 // @description  ① 外链直达：自动识别外链跳转中间页（link.csdn.net 等安全提示页/中转页），提取目标地址并直达，可在菜单全局启停；② 新标签打开：让所有链接点击默认在新标签页打开，支持站点级开关；不影响链接卡片内嵌的上层操作（按钮/下拉等）。
 // @author       fanghaydn
 // @match        *://*/*
@@ -85,6 +85,50 @@
   const setDisabledSites = (list) => storage.set(KEY_DISABLED_SITES, list);
 
   const host = location.hostname;
+
+  // ============================ 多语言（i18n） ============================
+  // 按浏览器语言（navigator.language）自动切换，默认英文。
+  // 菜单按钮统一风格：✅ 开启 / ❌ 关闭，括号内注明点击后的动作。
+
+  const MESSAGES = {
+    en: {
+      redirectToggleOn: '✅ Redirect Bypass: ON (click to turn OFF)',
+      redirectToggleOff: '❌ Redirect Bypass: OFF (click to turn ON)',
+      newTabToggleOn: '✅ Open in New Tab: ON (click to turn OFF)',
+      newTabToggleOff: '❌ Open in New Tab: OFF (click to turn ON)',
+      viewDisabledSites: '📋 View disabled site list',
+      toastRedirectOn: '✅ "Redirect Bypass" enabled globally (already-loaded pages are not affected)',
+      toastRedirectOff: '❌ "Redirect Bypass" disabled globally (takes effect on newly opened pages)',
+      toastNewTabOn: '✅ "Open in New Tab" enabled on this site',
+      toastNewTabOff: '❌ "Open in New Tab" disabled on this site',
+      disabledSitesHeader: 'Disabled sites:',
+      noDisabledSites: 'No disabled sites yet.',
+      confirmLabel: (url) => `🚀 External link detected: ${url}`,
+      confirmJump: 'Go now',
+      confirmStay: 'Stay here',
+      confirmRemember: 'Remember for this site',
+    },
+    zh: {
+      redirectToggleOn: '✅ 外链直达：已开启（点击停用）',
+      redirectToggleOff: '❌ 外链直达：已关闭（点击开启）',
+      newTabToggleOn: '✅ 新标签打开：已开启（点击停用）',
+      newTabToggleOff: '❌ 新标签打开：已关闭（点击开启）',
+      viewDisabledSites: '📋 查看已禁用的网站列表',
+      toastRedirectOn: '✅ 「外链直达」已全局启用（已加载的页面不受影响）',
+      toastRedirectOff: '❌ 「外链直达」已全局停用（新打开的页面立即生效）',
+      toastNewTabOn: '✅ 本站已启用「新标签打开」',
+      toastNewTabOff: '❌ 本站已禁用「新标签打开」',
+      disabledSitesHeader: '当前禁用的网站：',
+      noDisabledSites: '当前没有禁用的网站。',
+      confirmLabel: (url) => `🚀 检测到外链：${url}`,
+      confirmJump: '立即直达',
+      confirmStay: '留在此页',
+      confirmRemember: '记住本站',
+    },
+  };
+
+  const pageLang = String(navigator.language || 'en').toLowerCase();
+  const t = MESSAGES[pageLang.startsWith('zh') ? 'zh' : 'en'];
 
   // ============================ 外链直达（Redirect Detection） ============================
   // 方案：.plans/link-redirect-interstitial-detection.plan.md
@@ -237,7 +281,7 @@
     const label = document.createElement('span');
     label.style.cssText = 'white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 44vw;';
     label.title = targetUrl;
-    label.textContent = `🚀 检测到外链：${targetUrl}`;
+    label.textContent = t.confirmLabel(targetUrl);
 
     const makeBtn = (text, primary) => {
       const btn = document.createElement('button');
@@ -260,11 +304,11 @@
     const chk = document.createElement('input');
     chk.type = 'checkbox';
     const chkText = document.createElement('span');
-    chkText.textContent = '记住本站';
+    chkText.textContent = t.confirmRemember;
     chkWrap.append(chk, chkText);
 
-    const btnJump = makeBtn('立即直达', true);
-    const btnStay = makeBtn('留在此页', false);
+    const btnJump = makeBtn(t.confirmJump, true);
+    const btnStay = makeBtn(t.confirmStay, false);
 
     btnJump.addEventListener('click', () => {
       if (chk.checked) setDecision(host, 'auto');
@@ -421,14 +465,14 @@
       enabledOnThisSite = true;
     }
     setDisabledSites(list);
-    toast(enabledOnThisSite ? '✅ 本站已启用「新标签打开」' : '⛔ 本站已禁用「新标签打开」');
+    toast(enabledOnThisSite ? t.toastNewTabOn : t.toastNewTabOff);
   }
 
   function showSiteList() {
     const list = getDisabledSites();
     const msg = list.length
-      ? '当前禁用的网站：\n' + list.map((h) => '  • ' + h).join('\n')
-      : '当前没有禁用的网站。';
+      ? t.disabledSitesHeader + '\n' + list.map((h) => '  • ' + h).join('\n')
+      : t.noDisabledSites;
     alert(msg);
   }
 
@@ -437,9 +481,7 @@
   function toggleRedirectGlobal() {
     const next = !redirectEnabled();
     storage.set(KEY_REDIRECT_ENABLED, next);
-    toast(next
-      ? '🚀 「外链直达」已全局启用（已在当前页运行的检测不会回退）'
-      : '⛔ 「外链直达」已全局停用（新打开的页面立即生效）');
+    toast(next ? t.toastRedirectOn : t.toastRedirectOff);
   }
 
   // ============================ 轻提示 ============================
@@ -475,13 +517,13 @@
 
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand(
-      redirectEnabled() ? '🚀 外链直达：已启用（点击全局停用）' : '🚀 外链直达：已停用（点击全局启用）',
+      redirectEnabled() ? t.redirectToggleOn : t.redirectToggleOff,
       toggleRedirectGlobal
     );
     GM_registerMenuCommand(
-      enabledOnThisSite ? '⛔ 新标签打开：在本站禁用' : '✅ 新标签打开：在本站启用',
+      enabledOnThisSite ? t.newTabToggleOn : t.newTabToggleOff,
       toggleThisSite
     );
-    GM_registerMenuCommand('📋 查看禁用网站列表', showSiteList);
+    GM_registerMenuCommand(t.viewDisabledSites, showSiteList);
   }
 })();
