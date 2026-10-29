@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         链接新标签打开 (Open Links in New Tab)
 // @namespace    https://github.com/fanghaydn
-// @version      3.0.0
+// @version      3.0.1
 // @description  按白名单/黑名单规则控制链接新标签打开，支持 URL 通配符、快捷键、配置导入导出；并提供独立外链直达。
 // @author       fanghaydn
 // @match        *://*/*
