@@ -7,6 +7,8 @@ const vm = require('node:vm');
 function createPolicy() {
   const values = new Map();
   const menus = [];
+  const writes = [];
+  const changeListeners = new Map();
   const location = new URL('https://docs.example.com/start');
   const context = {
     URL,
@@ -26,8 +28,12 @@ function createPolicy() {
     },
     document: { addEventListener() {} },
     GM_getValue(key) { return values.get(key); },
-    GM_setValue(key, value) { values.set(key, value); },
+    GM_setValue(key, value) { values.set(key, value); writes.push(key); },
     GM_registerMenuCommand(label, handler) { menus.push([label, handler]); return menus.length; },
+    GM_addValueChangeListener(key, handler) {
+      if (!changeListeners.has(key)) changeListeners.set(key, []);
+      changeListeners.get(key).push(handler);
+    },
     globalThis: null,
   };
   context.globalThis = context;
@@ -35,7 +41,7 @@ function createPolicy() {
   const end = source.lastIndexOf('})();');
   source = `${source.slice(0, end)}globalThis.__policy = { defaultGlobalConfig, defaultProfile, compilePattern, validateGlobalConfig, validateProfile, compileRules, resolvePolicy, parseShortcut, loadPolicy, savePolicy };\n${source.slice(end)}`;
   vm.runInNewContext(source, context, { filename: 'open-link-new-tab.user.js' });
-  return { ...context.__policy, values, menus };
+  return { ...context.__policy, values, menus, writes, changeListeners };
 }
 
 test('glob patterns match protocol, host boundaries and path depth', () => {
@@ -50,6 +56,7 @@ test('glob patterns match protocol, host boundaries and path depth', () => {
   assert.equal(subdomain(new URL('https://example.com/docs/start')), false);
   assert.equal(subdomain(new URL('https://api.example.com/docs/deep/start')), false);
   assert.throws(() => compilePattern('https://example.com/path?x=*'));
+  assert.throws(() => compilePattern(`https://example.com/${'*a'.repeat(33)}`), /too many wildcards/);
 });
 
 test('rules use first matching action and fall back to the profile default', () => {
@@ -147,4 +154,19 @@ test('both profiles persist independently and mode switching preserves rules', (
   assert.equal(loaded.global.activeMode, 'allowlist');
   assert.equal(loaded.profiles.blocklist.rules[0].id, 'blocked');
   assert.equal(loaded.profiles.allowlist.rules[0].id, 'allowed');
+});
+
+test('remote policy reloads never write back to shared storage', async () => {
+  const { loadPolicy, writes, changeListeners } = createPolicy();
+  const before = writes.length;
+  loadPolicy({ persist: false });
+  assert.equal(writes.length, before);
+  loadPolicy();
+  assert.equal(writes.length, before);
+
+  for (const [key, listeners] of changeListeners) {
+    for (const listener of listeners) listener(key, null, null, true);
+  }
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(writes.length, before);
 });

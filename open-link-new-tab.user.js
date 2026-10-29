@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         链接新标签打开 (Open Links in New Tab)
 // @namespace    https://github.com/fanghaydn
-// @version      3.0.2
+// @version      3.0.3
 // @description  按白名单/黑名单规则控制链接新标签打开，支持 URL 通配符、快捷键、配置导入导出；并提供独立外链直达。
 // @author       fanghaydn
 // @match        *://*/*
@@ -125,16 +125,62 @@
     };
   }
 
-  // Compile only our small glob language, never user-supplied regular expressions.
-  function globRegex(glob, wildcard, deepWildcard = wildcard, flags = '') {
-    let result = '^';
+  // Match user-provided globs with a bounded state machine, never a backtracking regex.
+  const MAX_GLOB_WILDCARDS = 32;
+  function compileGlob(glob, { separator = null, singleMin = 0 } = {}) {
+    const tokens = [];
+    let literal = '';
+    let wildcards = 0;
+    const flushLiteral = () => {
+      if (literal) tokens.push({ literal });
+      literal = '';
+    };
     for (let i = 0; i < glob.length; i++) {
-      if (glob[i] === '*') {
-        if (glob[i + 1] === '*') { result += deepWildcard; i++; }
-        else result += wildcard;
-      } else result += glob[i].replace(/[\\^$.*+?()[\]{}|]/g, '\\$&');
+      if (glob[i] !== '*') {
+        literal += glob[i];
+        continue;
+      }
+      flushLiteral();
+      let deep = false;
+      while (glob[i + 1] === '*') {
+        deep = true;
+        i++;
+      }
+      if (++wildcards > MAX_GLOB_WILDCARDS) throw new Error('URL pattern has too many wildcards');
+      tokens.push({ wildcard: true, deep });
     }
-    return new RegExp(result + '$', flags);
+    flushLiteral();
+
+    return (value) => {
+      let reachable = new Uint8Array(value.length + 1);
+      reachable[0] = 1;
+      for (const token of tokens) {
+        const next = new Uint8Array(value.length + 1);
+        if (token.literal !== undefined) {
+          const size = token.literal.length;
+          for (let pos = 0; pos + size <= value.length; pos++) {
+            if (reachable[pos] && value.startsWith(token.literal, pos)) next[pos + size] = 1;
+          }
+        } else if (token.deep) {
+          let active = false;
+          for (let pos = 0; pos <= value.length; pos++) {
+            active = active || reachable[pos] === 1;
+            if (active) next[pos] = 1;
+          }
+        } else {
+          let active = false;
+          for (let pos = 0; pos <= value.length; pos++) {
+            if (pos > 0) {
+              if (separator !== null && value[pos - 1] === separator) active = false;
+              else active = active || reachable[pos - 1] === 1;
+            }
+            if (singleMin === 0 ? active || reachable[pos] === 1 : active) next[pos] = 1;
+          }
+        }
+        reachable = next;
+      }
+      return reachable[value.length] === 1;
+    };
   }
 
   function compilePattern(pattern) {
@@ -144,11 +190,11 @@
     const [, scheme, hostname, port, path] = parts;
     if (port && (+port < 1 || +port > 65535)) throw new Error(`Invalid port: ${pattern}`);
     if (hostname.includes('**') || /[^a-z\d.*\-[\]:]/i.test(hostname)) throw new Error(`Invalid host: ${pattern}`);
-    const hostRegex = hostname === '*' ? /^.+$/ : globRegex(hostname, '[^.]+', '[^.]+', 'i');
-    const pathRegex = globRegex(path, '[^/]*', '.*');
+    const hostRegex = hostname === '*' ? (value) => value.length > 0 : compileGlob(hostname.toLowerCase(), { separator: '.', singleMin: 1 });
+    const pathRegex = compileGlob(path, { separator: '/' });
     return (url) => (scheme === '*' || url.protocol === scheme.toLowerCase() + ':') &&
-      hostRegex.test(url.hostname) && (!port || +port === +(url.port || (url.protocol === 'https:' ? 443 : 80))) &&
-      pathRegex.test(url.pathname);
+      hostRegex(url.hostname.toLowerCase()) && (!port || +port === +(url.port || (url.protocol === 'https:' ? 443 : 80))) &&
+      pathRegex(url.pathname);
   }
 
   function parseShortcut(value) {
@@ -219,6 +265,7 @@
           if (!object(rule.query[side]) || Object.keys(rule.query[side]).length > 100) throw new Error(`${path}.query.${side}: expected parameter map (max 100)`);
           for (const value of Object.values(rule.query[side])) {
             if (typeof value !== 'string' || value.length > 2048) throw new Error(`${path}.query: invalid value glob`);
+            compileGlob(value);
           }
         }
       }
@@ -238,7 +285,7 @@
       }
       const queries = {};
       for (const [side, params] of Object.entries(rule.query || {})) {
-        queries[side] = Object.entries(params).map(([name, value]) => [name, globRegex(value, '.*')]);
+        queries[side] = Object.entries(params).map(([name, value]) => [name, compileGlob(value)]);
       }
       return { rule, matchers, queries };
     });
@@ -252,7 +299,7 @@
       if (Object.entries(matchers).some(([side, patterns]) => !patterns.some((match) => match(urls[side])))) continue;
       const same = source.origin === destination.origin;
       if (rule.linkType === 'same-origin' && !same || rule.linkType === 'cross-origin' && same) continue;
-      if (Object.entries(queries).some(([side, params]) => params.some(([name, re]) => !urls[side].searchParams.getAll(name).some((v) => re.test(v))))) continue;
+      if (Object.entries(queries).some(([side, params]) => params.some(([name, match]) => !urls[side].searchParams.getAll(name).some((v) => match(v))))) continue;
       return { action: rule.action, reason: rule.name || rule.id, ruleId: rule.id };
     }
     return { action: profile.mode === 'blocklist' ? 'new-tab' : 'native', reason: 'default' };
@@ -282,17 +329,21 @@
     }
   }
 
-  function loadPolicy() {
+  function loadPolicy({ persist = true } = {}) {
+    const save = (key, value) => {
+      if (!persist || JSON.stringify(storage.get(key, null)) === JSON.stringify(value)) return;
+      storage.set(key, value);
+    };
     const legacy = migrateLegacyConfig();
     const legacyPending = legacy && storage.get(KEY_LEGACY_MIGRATED, false) !== true;
-    if (legacyPending) for (const mode of Object.keys(legacy.profiles)) storage.set(PROFILE_KEYS[mode], legacy.profiles[mode]);
+    if (legacyPending) for (const mode of Object.keys(legacy.profiles)) save(PROFILE_KEYS[mode], legacy.profiles[mode]);
     let global = storage.get(KEY_GLOBAL, null);
     if (global === null) {
       global = legacyPending ? legacy.global : defaultGlobalConfig();
-      storage.set(KEY_GLOBAL, global);
+      save(KEY_GLOBAL, global);
     } else if (legacyPending) {
       global = legacy.global;
-      storage.set(KEY_GLOBAL, global);
+      save(KEY_GLOBAL, global);
     }
     try { global = validateGlobalConfig(global); }
     catch (error) {
@@ -311,14 +362,14 @@
         profile = { ...defaultProfile(mode), rules: [] };
         global.enabled = false;
       }
-      storage.set(PROFILE_KEYS[mode], profile);
+      save(PROFILE_KEYS[mode], profile);
       profiles[mode] = profile;
     }
-    if (legacyPending) storage.set(KEY_LEGACY_MIGRATED, true);
+    if (legacyPending) save(KEY_LEGACY_MIGRATED, true);
     if (storage.get(KEY_DISABLED_MIGRATED, false) !== true) {
       profiles.blocklist = validateProfile(loadLegacyDisabledSites(), 'blocklist');
-      storage.set(PROFILE_KEYS.blocklist, profiles.blocklist);
-      storage.set(KEY_DISABLED_MIGRATED, true);
+      save(PROFILE_KEYS.blocklist, profiles.blocklist);
+      save(KEY_DISABLED_MIGRATED, true);
     }
     return { global, profiles };
   }
@@ -796,15 +847,24 @@
   document.addEventListener('keydown', handleShortcut, true);
 
   if (typeof GM_addValueChangeListener === 'function') {
-    for (const key of [KEY_GLOBAL, ...Object.values(PROFILE_KEYS)]) GM_addValueChangeListener(key, (_key, _old, value, remote) => {
-      if (!remote) return;
+    let remoteReloadTimer = null;
+    const reloadRemotePolicy = () => {
+      remoteReloadTimer = null;
       try {
-        policy = loadPolicy();
+        // Remote tabs already persisted these values. Reloading must not write
+        // them back, otherwise two tabs can trigger each other indefinitely.
+        policy = loadPolicy({ persist: false });
         config = policy.global;
         profile = activeProfile();
         compiledRules = compileRules(profile);
         registerMenus();
       } catch (_) { /* Keep the last valid policy on invalid remote writes. */ }
+    };
+    for (const key of [KEY_GLOBAL, ...Object.values(PROFILE_KEYS)]) GM_addValueChangeListener(key, (_key, _old, value, remote) => {
+      if (!remote) return;
+      // A save writes three keys; collapse the notifications into one reload.
+      if (remoteReloadTimer !== null) return;
+      remoteReloadTimer = setTimeout(reloadRemotePolicy, 0);
     });
   }
 
