@@ -9,6 +9,7 @@
 - **地址规则**：分别匹配当前来源页面和点击目标；可设同源／跨源条件，支持按顺序启停和排序。
 - **Glob 地址**：安全、可读的通配符规则，不执行用户提供的正则表达式。
 - **快捷键**：默认 `Alt+Shift+O` 切换本站策略，`Alt+Shift+L` 打开设置，`Alt+Shift+P` 暂停或恢复当前页面接管。均可修改或清空。
+- **两套独立配置**：黑名单与白名单分别永久保存规则和兼容选项；切换模式不会覆盖另一套。
 - **配置迁移与备份**：旧版禁用网站自动迁移；设置面板可编辑规则、测试匹配、导入／导出 JSON。
 - **外链直达**：保持独立的全局开关和原有检测逻辑，与新标签策略无关。
 
@@ -41,52 +42,66 @@
 
 ### 配置示例
 
-设置面板的“JSON 导入／导出”区域支持编辑完整配置。示例：
+设置面板的“JSON 导入／导出”区域包含共享设置和两套独立档案。示例：
 
 ```json
 {
-  "version": 1,
-  "enabled": true,
-  "defaultAction": "new-tab",
-  "rules": [
-    {
-      "id": "admin-native",
-      "name": "后台保持网站原生行为",
-      "enabled": true,
-      "source": ["https://admin.example.com/**"],
-      "action": "native"
-    },
-    {
-      "id": "github-new-tab",
-      "name": "GitHub 链接新开",
-      "enabled": true,
-      "destination": ["https://github.com/**", "https://*.github.com/**"],
-      "action": "new-tab"
-    },
-    {
-      "id": "docs-external",
-      "name": "文档站仅新开跨源链接",
-      "enabled": true,
-      "source": ["https://docs.example.com/**"],
-      "linkType": "cross-origin",
-      "action": "new-tab"
+  "global": {
+    "version": 1,
+    "enabled": true,
+    "activeMode": "blocklist",
+    "shortcuts": {
+      "toggleCurrentSite": "Alt+Shift+O",
+      "openSettings": "Alt+Shift+L",
+      "toggleSessionPause": "Alt+Shift+P"
     }
-  ],
-  "behavior": {
-    "skipSameDocument": true,
-    "respectExistingTarget": true,
-    "respectSitePreventDefault": true,
-    "skipInteractiveChildren": true
   },
-  "shortcuts": {
-    "toggleCurrentSite": "Alt+Shift+O",
-    "openSettings": "Alt+Shift+L",
-    "toggleSessionPause": "Alt+Shift+P"
+  "profiles": {
+    "blocklist": {
+      "version": 1,
+      "mode": "blocklist",
+      "rules": [
+        {
+          "id": "admin-native",
+          "name": "后台保持网站原生行为",
+          "enabled": true,
+          "source": ["https://admin.example.com/**"],
+          "action": "native"
+        }
+      ],
+      "behavior": {
+        "skipSameDocument": true,
+        "respectExistingTarget": true,
+        "respectSitePreventDefault": true,
+        "skipInteractiveChildren": true
+      }
+    },
+    "allowlist": {
+      "version": 1,
+      "mode": "allowlist",
+      "rules": [
+        {
+          "id": "github-new-tab",
+          "name": "GitHub 链接新开",
+          "enabled": true,
+          "destination": ["https://github.com/**", "https://*.github.com/**"],
+          "action": "new-tab"
+        }
+      ],
+      "behavior": {
+        "skipSameDocument": true,
+        "respectExistingTarget": true,
+        "respectSitePreventDefault": true,
+        "skipInteractiveChildren": true
+      }
+    }
   }
 }
 ```
 
 快捷键只接受 `Alt+Shift+字母或数字` 组合，避免抢占浏览器常用的系统快捷键。快捷键在输入框、编辑区域和中文输入法组合输入时不触发；当前标签页暂停不影响外链直达。
+
+`global` 保存全局启用状态、当前模式和快捷键；`profiles.blocklist` 与 `profiles.allowlist` 各自使用独立存储键保存规则及兼容选项。切换当前模式只改变 `activeMode`，不会改写另一套档案。
 
 ## 行为与兼容性
 
@@ -97,7 +112,7 @@
 - Tampermonkey 菜单包含本站新标签／网站原生／继承、暂停当前页、打开设置和外链直达开关。
 - 默认内置 Google 搜索页 `native` 规则；此规则可在设置面板排序、修改或删除。
 
-旧版 `oint_disabled_sites` 禁用名单会在首次启动时迁移成 `native` 来源规则，原名单保留作为备份。现有其他外链直达偏好不受影响。
+旧版单一配置会一次性迁移到它对应的档案；旧版 `oint_disabled_sites` 禁用名单会迁移到黑名单档案，原名单保留作为备份。迁移完成后不会再次覆盖用户修改。现有其他外链直达偏好不受影响。
 
 ## 开发测试
 

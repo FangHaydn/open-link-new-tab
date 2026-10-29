@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         链接新标签打开 (Open Links in New Tab)
 // @namespace    https://github.com/fanghaydn
-// @version      3.0.1
+// @version      3.0.2
 // @description  按白名单/黑名单规则控制链接新标签打开，支持 URL 通配符、快捷键、配置导入导出；并提供独立外链直达。
 // @author       fanghaydn
 // @match        *://*/*
@@ -85,27 +85,42 @@
 
   const host = location.hostname;
   const KEY_CONFIG = 'oint_config_v1';
+  const KEY_GLOBAL = 'oint_policy_global_v1';
+  const KEY_LEGACY_MIGRATED = 'oint_policy_legacy_migrated_v1';
+  const KEY_DISABLED_MIGRATED = 'oint_policy_blocklist_migrated_v1';
+  const PROFILE_KEYS = {
+    blocklist: 'oint_policy_blocklist_v1',
+    allowlist: 'oint_policy_allowlist_v1',
+  };
 
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const text = (zh, en) => String(navigator.language || 'en').toLowerCase().startsWith('zh') ? zh : en;
 
-  function defaultConfig() {
+  function defaultGlobalConfig() {
     return {
       version: 1,
       enabled: true,
-      defaultAction: 'new-tab',
-      rules: [{
-        id: 'google-search', name: 'Google search', enabled: true,
-        source: ['https://www.google.com/search*', 'https://*.google.com/search*'],
-        action: 'native',
-      }],
-      behavior: {
-        skipSameDocument: true, respectExistingTarget: true,
-        respectSitePreventDefault: true, skipInteractiveChildren: true,
-      },
+      activeMode: 'blocklist',
       shortcuts: {
         toggleCurrentSite: 'Alt+Shift+O', openSettings: 'Alt+Shift+L',
         toggleSessionPause: 'Alt+Shift+P',
+      },
+    };
+  }
+
+  function defaultProfile(mode) {
+    const blocklist = mode === 'blocklist';
+    return {
+      version: 1,
+      mode,
+      rules: blocklist ? [{
+        id: 'google-search', name: 'Google search', enabled: true,
+        source: ['https://www.google.com/search*', 'https://*.google.com/search*'],
+        action: 'native',
+      }] : [],
+      behavior: {
+        skipSameDocument: true, respectExistingTarget: true,
+        respectSitePreventDefault: true, skipInteractiveChildren: true,
       },
     };
   }
@@ -148,17 +163,38 @@
     return ['Ctrl', 'Alt', 'Shift', 'Meta'].filter((p) => parts.includes(p)).concat(key.toUpperCase()).join('+');
   }
 
-  function validateConfig(input) {
+  function validateGlobalConfig(input) {
     const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
     const keys = (v, allowed, path) => {
       if (!object(v)) throw new Error(`${path} must be an object`);
       for (const key of Object.keys(v)) if (!allowed.includes(key)) throw new Error(`Unknown field: ${path}.${key}`);
     };
-    keys(input, ['version', 'enabled', 'defaultAction', 'rules', 'behavior', 'shortcuts'], 'config');
-    if (input.version !== 1) throw new Error('Unsupported config version');
-    if (typeof input.enabled !== 'boolean') throw new Error('enabled must be boolean');
+    keys(input, ['version', 'enabled', 'activeMode', 'shortcuts'], 'global');
+    if (input.version !== 1 || typeof input.enabled !== 'boolean' || !['blocklist', 'allowlist'].includes(input.activeMode)) {
+      throw new Error('Invalid global policy configuration');
+    }
+    const defaults = defaultGlobalConfig();
+    keys(input.shortcuts, Object.keys(defaults.shortcuts), 'shortcuts');
+    const shortcuts = new Set();
+    const result = clone(input);
+    for (const key of Object.keys(defaults.shortcuts)) {
+      const binding = parseShortcut(input.shortcuts[key]);
+      if (binding && shortcuts.has(binding)) throw new Error(`Shortcut conflict: ${binding}`);
+      if (binding) shortcuts.add(binding);
+      result.shortcuts[key] = binding;
+    }
+    return result;
+  }
+
+  function validateProfile(input, mode) {
+    const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+    const keys = (v, allowed, path) => {
+      if (!object(v)) throw new Error(`${path} must be an object`);
+      for (const key of Object.keys(v)) if (!allowed.includes(key)) throw new Error(`Unknown field: ${path}.${key}`);
+    };
+    keys(input, ['version', 'mode', 'rules', 'behavior'], 'profile');
+    if (input.version !== 1 || input.mode !== mode) throw new Error(`Invalid ${mode} profile`);
     const actions = ['new-tab', 'native'];
-    if (!actions.includes(input.defaultAction)) throw new Error('Invalid defaultAction');
     if (!Array.isArray(input.rules) || input.rules.length > 500) throw new Error('rules must be an array (max 500)');
     const result = clone(input);
     const ids = new Set();
@@ -187,23 +223,15 @@
         }
       }
     });
-    const defaults = defaultConfig();
+    const defaults = defaultProfile(mode);
     keys(input.behavior, Object.keys(defaults.behavior), 'behavior');
     for (const key of Object.keys(defaults.behavior)) if (typeof input.behavior[key] !== 'boolean') throw new Error(`behavior.${key} must be boolean`);
     if (!input.behavior.respectSitePreventDefault) throw new Error('respectSitePreventDefault must remain true; forced SPA navigation is not supported');
-    keys(input.shortcuts, Object.keys(defaults.shortcuts), 'shortcuts');
-    const shortcuts = new Set();
-    for (const key of Object.keys(defaults.shortcuts)) {
-      const binding = parseShortcut(input.shortcuts[key]);
-      if (binding && shortcuts.has(binding)) throw new Error(`Shortcut conflict: ${binding}`);
-      if (binding) shortcuts.add(binding);
-      result.shortcuts[key] = binding;
-    }
     return result;
   }
 
-  function compileRules(config) {
-    return config.rules.map((rule) => {
+  function compileRules(profile) {
+    return profile.rules.map((rule) => {
       const matchers = {};
       for (const side of ['source', 'destination']) {
         if (rule[side]) matchers[side] = rule[side].map(compilePattern);
@@ -216,8 +244,8 @@
     });
   }
 
-  function resolvePolicy(config, compiled, source, destination, paused = false) {
-    if (!config.enabled || paused) return { action: 'native', reason: paused ? 'paused' : 'disabled' };
+  function resolvePolicy(global, profile, compiled, source, destination, paused = false) {
+    if (!global.enabled || paused) return { action: 'native', reason: paused ? 'paused' : 'disabled' };
     for (const { rule, matchers, queries } of compiled) {
       if (!rule.enabled) continue;
       const urls = { source, destination };
@@ -227,44 +255,111 @@
       if (Object.entries(queries).some(([side, params]) => params.some(([name, re]) => !urls[side].searchParams.getAll(name).some((v) => re.test(v))))) continue;
       return { action: rule.action, reason: rule.name || rule.id, ruleId: rule.id };
     }
-    return { action: config.defaultAction, reason: 'default' };
+    return { action: profile.mode === 'blocklist' ? 'new-tab' : 'native', reason: 'default' };
   }
 
-  function loadConfig() {
+  function migrateLegacyConfig() {
     const saved = storage.get(KEY_CONFIG, null);
-    if (saved !== null) {
-      try { return validateConfig(saved); }
-      catch (error) {
-        console.warn('[Open Links] Invalid stored config; new-tab handling paused. Open settings to repair.', error);
-        return { ...defaultConfig(), enabled: false };
-      }
+    if (saved === null) return null;
+    try {
+      if (!saved || saved.version !== 1 || !['new-tab', 'native'].includes(saved.defaultAction)) throw new Error('Unsupported legacy config');
+      const mode = saved.defaultAction === 'new-tab' ? 'blocklist' : 'allowlist';
+      return {
+        global: {
+          version: 1, enabled: saved.enabled === true, activeMode: mode,
+          shortcuts: saved.shortcuts || defaultGlobalConfig().shortcuts,
+        },
+        profiles: {
+          [mode]: {
+            version: 1, mode, rules: saved.rules,
+            behavior: saved.behavior || defaultProfile(mode).behavior,
+          },
+        },
+      };
+    } catch (error) {
+      console.warn('[Open Links] Legacy config could not be migrated.', error);
+      return null;
     }
-    const config = defaultConfig();
+  }
+
+  function loadPolicy() {
+    const legacy = migrateLegacyConfig();
+    const legacyPending = legacy && storage.get(KEY_LEGACY_MIGRATED, false) !== true;
+    if (legacyPending) for (const mode of Object.keys(legacy.profiles)) storage.set(PROFILE_KEYS[mode], legacy.profiles[mode]);
+    let global = storage.get(KEY_GLOBAL, null);
+    if (global === null) {
+      global = legacyPending ? legacy.global : defaultGlobalConfig();
+      storage.set(KEY_GLOBAL, global);
+    } else if (legacyPending) {
+      global = legacy.global;
+      storage.set(KEY_GLOBAL, global);
+    }
+    try { global = validateGlobalConfig(global); }
+    catch (error) {
+      console.warn('[Open Links] Invalid global policy config; link handling paused. Open settings to repair.', error);
+      global = { ...defaultGlobalConfig(), enabled: false };
+    }
+
+    const profiles = {};
+    for (const mode of Object.keys(PROFILE_KEYS)) {
+      let profile = storage.get(PROFILE_KEYS[mode], null);
+      if (profile === null && legacy && legacy.profiles[mode]) profile = legacy.profiles[mode];
+      if (profile === null) profile = defaultProfile(mode);
+      try { profile = validateProfile(profile, mode); }
+      catch (error) {
+        console.warn(`[Open Links] Invalid ${mode} profile; new-tab handling paused. Open settings to repair.`, error);
+        profile = { ...defaultProfile(mode), rules: [] };
+        global.enabled = false;
+      }
+      storage.set(PROFILE_KEYS[mode], profile);
+      profiles[mode] = profile;
+    }
+    if (legacyPending) storage.set(KEY_LEGACY_MIGRATED, true);
+    if (storage.get(KEY_DISABLED_MIGRATED, false) !== true) {
+      profiles.blocklist = validateProfile(loadLegacyDisabledSites(), 'blocklist');
+      storage.set(PROFILE_KEYS.blocklist, profiles.blocklist);
+      storage.set(KEY_DISABLED_MIGRATED, true);
+    }
+    return { global, profiles };
+  }
+
+  let policy = loadPolicy();
+  let config = policy.global;
+  let profile = policy.profiles[config.activeMode];
+
+  function activeProfile() { return policy.profiles[config.activeMode]; }
+
+  function loadLegacyDisabledSites() {
+    const blocklist = defaultProfile('blocklist');
     // Keep hostname semantics (both schemes, any port), without deleting the legacy backup.
     for (const hostname of getDisabledSites()) {
       try {
         compilePattern(`*://${hostname}/**`);
-        config.rules.unshift({ id: `site:${hostname}`, name: hostname, enabled: true, source: [`*://${hostname}/**`], action: 'native' });
+        blocklist.rules.unshift({ id: `site:${hostname}`, name: hostname, enabled: true, source: [`*://${hostname}/**`], action: 'native' });
       } catch (_) { /* Skip malformed legacy hosts. */ }
     }
-    const migrated = validateConfig(config);
-    storage.set(KEY_CONFIG, migrated);
-    return migrated;
+    return blocklist;
   }
 
-  let config = loadConfig();
-  let compiledRules = compileRules(config);
+  let compiledRules = compileRules(activeProfile());
   let sessionPaused = false;
   let settingsHost = null;
   const menuIds = [];
 
-  function saveConfig(next) {
-    const validated = validateConfig(next);
-    storage.set(KEY_CONFIG, validated);
+  function savePolicy(nextGlobal, nextProfiles) {
+    const validatedGlobal = validateGlobalConfig(nextGlobal);
+    const validatedProfiles = Object.fromEntries(Object.keys(PROFILE_KEYS).map((mode) => [mode, validateProfile(nextProfiles[mode], mode)]));
+    storage.set(KEY_GLOBAL, validatedGlobal);
+    for (const mode of Object.keys(PROFILE_KEYS)) storage.set(PROFILE_KEYS[mode], validatedProfiles[mode]);
     // Read back before replacing the in-memory policy, including localStorage fallback failures.
-    if (JSON.stringify(storage.get(KEY_CONFIG, null)) !== JSON.stringify(validated)) throw new Error('Could not save configuration');
-    config = validated;
-    compiledRules = compileRules(config);
+    if (JSON.stringify(storage.get(KEY_GLOBAL, null)) !== JSON.stringify(validatedGlobal) ||
+        Object.keys(PROFILE_KEYS).some((mode) => JSON.stringify(storage.get(PROFILE_KEYS[mode], null)) !== JSON.stringify(validatedProfiles[mode]))) {
+      throw new Error('Could not save configuration');
+    }
+    policy = { global: validatedGlobal, profiles: validatedProfiles };
+    config = policy.global;
+    profile = activeProfile();
+    compiledRules = compileRules(profile);
     registerMenus();
   }
 
@@ -589,12 +684,12 @@
     }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
     const source = new URL(location.href);
-    if (config.behavior.skipSameDocument && sameDocument(source, url)) return false;
+    if (profile.behavior.skipSameDocument && sameDocument(source, url)) return false;
 
     if (anchor.hasAttribute('download')) return false;
-    if (config.behavior.respectExistingTarget && anchor.target && anchor.target !== '_self') return false;
+    if (profile.behavior.respectExistingTarget && anchor.target && anchor.target !== '_self') return false;
 
-    return resolvePolicy(config, compiledRules, source, url, sessionPaused).action === 'new-tab';
+    return resolvePolicy(config, profile, compiledRules, source, url, sessionPaused).action === 'new-tab';
   }
 
   function sameDocument(source, destination) {
@@ -617,7 +712,7 @@
     // 关键：点击命中的是链接内嵌的"上层操作"元素（按钮/下拉/输入等）时跳过，
     // 不改变 target，避免影响站点的卡片式交互。
     const overlay = event.target.closest(OVERLAY_SELECTOR);
-    if (config.behavior.skipInteractiveChildren && overlay && overlay !== anchor && anchor.contains(overlay)) return;
+    if (profile.behavior.skipInteractiveChildren && overlay && overlay !== anchor && anchor.contains(overlay)) return;
 
     if (!shouldOpenInNewTab(anchor)) return;
 
@@ -648,12 +743,13 @@
   function setSiteAction(action) {
     try {
       const hostname = location.hostname;
-      const next = clone(config);
+      const nextProfiles = clone(policy.profiles);
+      const next = nextProfiles[config.activeMode];
       next.rules = next.rules.filter((rule) => rule.id !== `site:${hostname}`);
       if (action !== 'inherit') next.rules.unshift({
         id: `site:${hostname}`, name: hostname, enabled: true, source: [`*://${hostname}/**`], action,
       });
-      saveConfig(next);
+      savePolicy(clone(config), nextProfiles);
       toast(`${hostname}: ${actionLabel(action)}`);
     } catch (error) { toast(error.message); }
   }
@@ -665,8 +761,8 @@
 
   function toggleThisSite() {
     const source = new URL(location.href);
-    const policy = resolvePolicy({ ...config, enabled: true }, compiledRules, source, source);
-    setSiteAction(policy.action === 'new-tab' ? 'native' : 'new-tab');
+    const result = resolvePolicy({ ...config, enabled: true }, profile, compiledRules, source, source);
+    setSiteAction(result.action === 'new-tab' ? 'native' : 'new-tab');
   }
 
   function toggleSessionPause() {
@@ -700,12 +796,13 @@
   document.addEventListener('keydown', handleShortcut, true);
 
   if (typeof GM_addValueChangeListener === 'function') {
-    GM_addValueChangeListener(KEY_CONFIG, (_key, _old, value, remote) => {
+    for (const key of [KEY_GLOBAL, ...Object.values(PROFILE_KEYS)]) GM_addValueChangeListener(key, (_key, _old, value, remote) => {
       if (!remote) return;
       try {
-        const next = validateConfig(value);
-        config = next;
-        compiledRules = compileRules(next);
+        policy = loadPolicy();
+        config = policy.global;
+        profile = activeProfile();
+        compiledRules = compileRules(profile);
         registerMenus();
       } catch (_) { /* Keep the last valid policy on invalid remote writes. */ }
     });
@@ -717,7 +814,7 @@
     menuIds.splice(0).forEach((id) => GM_unregisterMenuCommand(id));
     const add = (label, handler) => menuIds.push(GM_registerMenuCommand(label, handler));
     add(text('设置 / 白黑名单 / 配置导入导出', 'Settings / Rules / Import & Export'), openSettings);
-    const site = config.rules.find((rule) => rule.id === `site:${location.hostname}` && rule.enabled);
+    const site = profile.rules.find((rule) => rule.id === `site:${location.hostname}` && rule.enabled);
     for (const action of ['new-tab', 'native', 'inherit']) {
       const selected = site ? site.action === action : action === 'inherit';
       add(`${selected ? '●' : '○'} ${text('本站', 'This site')}: ${actionLabel(action)}`, () => setSiteAction(action));
@@ -736,7 +833,9 @@
     const isZh = String(navigator.language || 'en').toLowerCase().startsWith('zh');
     const words = isZh ? {
       title: '链接策略', subtitle: '按规则决定链接留在当前标签还是新开标签。规则从上到下匹配，第一条命中优先。',
-      enabled: '启用链接策略', default: '无规则命中时', newTab: '新标签打开（黑名单模式）', native: '网站原生（白名单模式）',
+      enabled: '启用链接策略', mode: '当前模式', blocklist: '黑名单模式', allowlist: '白名单模式',
+      blocklistHelp: '默认新标签，规则放行网站原生', allowlistHelp: '默认网站原生，规则放行新标签',
+      default: '无规则命中时', newTab: '新标签打开', native: '网站原生',
       add: '+ 添加规则', save: '保存策略', close: '关闭', rules: '规则（拖动按钮调整顺序）',
       name: '名称', action: '命中时', source: '来源页面 URL（可留空）', dest: '目标链接 URL（可留空）', type: '链接关系',
       all: '所有链接', same: '同源', cross: '跨源', remove: '删除', up: '上移', down: '下移',
@@ -748,7 +847,9 @@
       sourceHelp: '例如 https://docs.example.com/**', glob: '* 匹配单层；** 匹配任意层级。不含查询参数和锚点。',
     } : {
       title: 'Link policy', subtitle: 'Rules decide whether links stay native or open in a new tab. First match wins.',
-      enabled: 'Enable link policy', default: 'When no rule matches', newTab: 'Open in new tab (blocklist mode)', native: 'Website default (allowlist mode)',
+      enabled: 'Enable link policy', mode: 'Active mode', blocklist: 'Blocklist mode', allowlist: 'Allowlist mode',
+      blocklistHelp: 'New tab by default; rules opt into native', allowlistHelp: 'Native by default; rules opt into new tab',
+      default: 'When no rule matches', newTab: 'Open in new tab', native: 'Website default',
       add: '+ Add rule', save: 'Save policy', close: 'Close', rules: 'Rules (use arrows to reorder)',
       name: 'Name', action: 'On match', source: 'Source page URL (optional)', dest: 'Destination URL (optional)', type: 'Link relation',
       all: 'Any link', same: 'Same origin', cross: 'Cross origin', remove: 'Delete', up: 'Move up', down: 'Move down',
@@ -760,8 +861,8 @@
       sourceHelp: 'Example: https://docs.example.com/**', glob: '* matches one path segment; ** matches any depth. Query/hash excluded.',
     };
     const actionOptions = (selected) => ['new-tab', 'native'].map((action) => `<option value="${action}" ${selected === action ? 'selected' : ''}>${action === 'new-tab' ? escapeHtml(words.newTab) : escapeHtml(words.native)}</option>`).join('');
-    const rulesHtml = config.rules.map((rule, index) => `<article class="oint-rule" data-rule="${index}" data-id="${escapeHtml(rule.id)}" data-query="${escapeHtml(JSON.stringify(rule.query || {}))}">
-      <header><strong>#${index + 1}</strong><button type="button" data-move="-1" aria-label="${words.up}" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-move="1" aria-label="${words.down}" ${index === config.rules.length - 1 ? 'disabled' : ''}>↓</button><label><input data-field="enabled" type="checkbox" ${rule.enabled ? 'checked' : ''}> ${escapeHtml(words.enabled)}</label><button type="button" data-remove>${escapeHtml(words.remove)}</button></header>
+    const rulesHtml = profile.rules.map((rule, index) => `<article class="oint-rule" data-rule="${index}" data-id="${escapeHtml(rule.id)}" data-query="${escapeHtml(JSON.stringify(rule.query || {}))}">
+      <header><strong>#${index + 1}</strong><button type="button" data-move="-1" aria-label="${words.up}" ${index === 0 ? 'disabled' : ''}>↑</button><button type="button" data-move="1" aria-label="${words.down}" ${index === profile.rules.length - 1 ? 'disabled' : ''}>↓</button><label><input data-field="enabled" type="checkbox" ${rule.enabled ? 'checked' : ''}> ${escapeHtml(words.enabled)}</label><button type="button" data-remove>${escapeHtml(words.remove)}</button></header>
       <div class="oint-grid"><label>${escapeHtml(words.name)}<input data-field="name" value="${escapeHtml(rule.name)}"></label><label>${escapeHtml(words.action)}<select data-field="action">${actionOptions(rule.action)}</select></label>
       <label>${escapeHtml(words.source)}<textarea data-field="source" placeholder="https://admin.example.com/**">${escapeHtml(patternText(rule.source))}</textarea></label>
       <label>${escapeHtml(words.dest)}<textarea data-field="destination" placeholder="https://github.com/**">${escapeHtml(patternText(rule.destination))}</textarea></label>
@@ -770,15 +871,15 @@
     hostNode.innerHTML = `<div class="oint-backdrop"><section class="oint-panel" role="dialog" aria-modal="true" aria-labelledby="oint-title" tabindex="-1">
       <header class="oint-head"><div><span class="oint-kicker">OPEN LINK CONTROL / 03</span><h1 id="oint-title">${escapeHtml(words.title)}</h1><p>${escapeHtml(words.subtitle)}</p></div><button type="button" class="oint-close" data-close aria-label="${words.close}">×</button></header>
       <div class="oint-content"><section class="oint-section"><label class="oint-switch"><input id="oint-enabled" type="checkbox" ${config.enabled ? 'checked' : ''}> ${escapeHtml(words.enabled)}</label>
-      <label>${escapeHtml(words.default)}<select id="oint-default">${actionOptions(config.defaultAction)}</select></label>
+      <div class="oint-mode" role="group" aria-label="${escapeHtml(words.mode)}"><button type="button" data-mode="blocklist" class="${config.activeMode === 'blocklist' ? 'active' : ''}">${escapeHtml(words.blocklist)}<small>${escapeHtml(words.blocklistHelp)}</small></button><button type="button" data-mode="allowlist" class="${config.activeMode === 'allowlist' ? 'active' : ''}">${escapeHtml(words.allowlist)}<small>${escapeHtml(words.allowlistHelp)}</small></button></div>
       <h2>${escapeHtml(words.rules)}</h2><p class="oint-help">${escapeHtml(words.glob)}</p><div id="oint-rules">${rulesHtml || `<p class="oint-empty">${escapeHtml(words.none)}</p>`}</div><button type="button" id="oint-add" class="oint-secondary">${escapeHtml(words.add)}</button></section>
       <section class="oint-section"><h2>${escapeHtml(words.shortcuts)}</h2><p class="oint-help">${escapeHtml(words.record)}</p><div class="oint-shortcuts">${[['toggleCurrentSite', words.site], ['openSettings', words.settings], ['toggleSessionPause', words.pause]].map(([key, label]) => `<label>${escapeHtml(label)}<input data-shortcut="${key}" value="${escapeHtml(config.shortcuts[key])}" placeholder="Disabled"></label>`).join('')}</div></section>
-      <section class="oint-section"><h2>${escapeHtml(words.behavior)}</h2><div class="oint-checks">${[['skipSameDocument', words.anchor], ['respectExistingTarget', words.target], ['skipInteractiveChildren', words.controls]].map(([key, label]) => `<label><input data-behavior="${key}" type="checkbox" ${config.behavior[key] ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}</div></section>
+      <section class="oint-section"><h2>${escapeHtml(words.behavior)}</h2><div class="oint-checks">${[['skipSameDocument', words.anchor], ['respectExistingTarget', words.target], ['skipInteractiveChildren', words.controls]].map(([key, label]) => `<label><input data-behavior="${key}" type="checkbox" ${profile.behavior[key] ? 'checked' : ''}> ${escapeHtml(label)}</label>`).join('')}</div></section>
       <section class="oint-section"><h2>${escapeHtml(words.test)}</h2><div class="oint-test"><label>${escapeHtml(words.srcTest)}<input id="oint-test-source" value="${escapeHtml(location.href)}"></label><label>${escapeHtml(words.dstTest)}<input id="oint-test-dest" placeholder="https://example.com/page"></label><button type="button" id="oint-test" class="oint-secondary">${escapeHtml(words.run)}</button></div><output id="oint-test-result" aria-live="polite"></output></section>
       <details class="oint-section"><summary>${escapeHtml(words.advanced)}</summary><p class="oint-help">Versioned JSON. Invalid imports leave the current policy unchanged.</p><textarea id="oint-json" spellcheck="false"></textarea><div class="oint-actions"><button type="button" id="oint-copy" class="oint-secondary">${escapeHtml(words.copy)}</button><button type="button" id="oint-import" class="oint-secondary">${escapeHtml(words.validate)}</button></div></details>
       </div><footer class="oint-foot"><span id="oint-status" role="status"></span><div><button type="button" class="oint-secondary" data-close>${escapeHtml(words.close)}</button><button type="button" id="oint-save" class="oint-primary">${escapeHtml(words.save)}</button></div></footer>
       </section></div>`;
-    hostNode.querySelector('#oint-json').value = JSON.stringify(config, null, 2);
+    hostNode.querySelector('#oint-json').value = JSON.stringify({ global: config, profiles: policy.profiles }, null, 2);
     hostNode._words = words;
     // Reattach the persistent stylesheet after replacing the panel markup.
     if (hostNode._style) hostNode.prepend(hostNode._style);
@@ -793,6 +894,7 @@
     settingsHost.style.cssText = 'position: fixed; inset: 0; z-index: 2147483647; color-scheme: light;';
     const style = document.createElement('style');
     style.textContent = `#oint-settings *{box-sizing:border-box}#oint-settings{--ink:#18201e;--muted:#66736e;--line:#dce3dc;--paper:#f3f4ec;--card:#fffef9;--teal:#176b5b;--rust:#ae512e;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink);isolation:isolate}#oint-settings button,#oint-settings input,#oint-settings select,#oint-settings textarea{font:inherit}#oint-settings button{cursor:pointer}#oint-settings .oint-backdrop{position:fixed;inset:0;background-color:#18201e;background-color:rgba(18,29,26,.56);display:grid;place-items:center;padding:18px}#oint-settings .oint-panel{width:min(920px,100%);max-height:min(92vh,1000px);display:flex;flex-direction:column;background-color:#f3f4ec;background-color:var(--paper);border:1px solid rgba(255,255,255,.4);border-radius:18px;box-shadow:0 24px 90px #081b1680;overflow:hidden}#oint-settings .oint-head{display:flex;justify-content:space-between;gap:18px;padding:24px 30px 18px;border-bottom:1px solid var(--line);background:linear-gradient(110deg,#f8f6eb,#e4eee6)}#oint-settings .oint-kicker{font:600 11px/1.4 ui-monospace,monospace;letter-spacing:.12em;color:var(--teal)}#oint-settings h1{font:600 34px/1.1 Georgia,serif;margin:8px 0}#oint-settings h2{font:600 20px/1.2 Georgia,serif;margin:22px 0 8px}#oint-settings p{margin:0;color:var(--muted)}#oint-settings .oint-close{align-self:flex-start;border:0;background:none;font-size:28px;color:var(--muted)}#oint-settings .oint-content{overflow:auto;padding:6px 30px 24px}#oint-settings .oint-section{padding:18px 0;border-bottom:1px solid var(--line)}#oint-settings label{display:grid;gap:5px;font-size:13px;font-weight:600}#oint-settings input:not([type=checkbox]),#oint-settings select,#oint-settings textarea{width:100%;min-width:0;padding:9px 10px;border:1px solid #cbd5cd;border-radius:8px;background-color:#fffef9;background-color:var(--card);color:var(--ink);outline:none}#oint-settings input:focus,#oint-settings select:focus,#oint-settings textarea:focus{border-color:var(--teal);box-shadow:0 0 0 3px #176b5b25}#oint-settings textarea{min-height:76px;resize:vertical;font:12px/1.5 ui-monospace,monospace}#oint-settings .oint-switch{display:flex;align-items:center;gap:8px;font-size:15px}#oint-settings .oint-switch input,#oint-settings input[type=checkbox]{accent-color:var(--teal)}#oint-settings .oint-rule{margin:12px 0;padding:15px;background-color:#fffef9;background-color:var(--card);border:1px solid var(--line);border-radius:12px}#oint-settings .oint-rule header{display:flex;align-items:center;gap:8px;margin-bottom:12px}#oint-settings .oint-rule header strong{margin-right:auto;font:13px ui-monospace,monospace;color:var(--teal)}#oint-settings .oint-rule header button,#oint-settings .oint-secondary{padding:7px 11px;border:1px solid var(--line);border-radius:7px;background:transparent;color:var(--ink)}#oint-settings button:hover{filter:brightness(.94)}#oint-settings button:focus-visible{outline:3px solid #23887580;outline-offset:2px}#oint-settings button:disabled{opacity:.4;cursor:not-allowed}#oint-settings .oint-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}#oint-settings .oint-help{font-size:12px;margin:5px 0 10px}#oint-settings .oint-empty{padding:18px;border:1px dashed var(--line);border-radius:10px}#oint-settings .oint-shortcuts{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}#oint-settings .oint-checks{display:flex;gap:18px;flex-wrap:wrap}#oint-settings .oint-checks label{display:flex;align-items:center}#oint-settings .oint-test{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end}#oint-settings #oint-test-result{display:block;margin-top:10px;font-weight:600;color:var(--teal)}#oint-settings details summary{cursor:pointer;font-weight:600}#oint-settings #oint-json{margin-top:12px;min-height:220px}#oint-settings .oint-actions{display:flex;gap:8px;margin-top:8px}#oint-settings .oint-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 30px;border-top:1px solid var(--line);background:#faf9f2}#oint-settings .oint-foot>div{display:flex;gap:8px}#oint-settings .oint-primary{padding:9px 16px;border:0;border-radius:8px;background:var(--teal);color:white;font-weight:600}#oint-settings #oint-status{color:var(--rust);font-size:13px}@media(max-width:640px){#oint-settings .oint-backdrop{padding:0}#oint-settings .oint-panel{max-height:100vh;height:100vh;border-radius:0}#oint-settings .oint-head,#oint-settings .oint-content,#oint-settings .oint-foot{padding-left:18px;padding-right:18px}#oint-settings .oint-grid,#oint-settings .oint-shortcuts{grid-template-columns:1fr}#oint-settings .oint-test{grid-template-columns:1fr}#oint-settings .oint-rule header{flex-wrap:wrap}}`;
+    style.textContent += `#oint-settings .oint-mode{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:14px 0 4px;padding:4px;border:1px solid var(--line);border-radius:11px;background:#e9ece4}#oint-settings .oint-mode button{display:grid;gap:2px;padding:10px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted);text-align:left;font-weight:600}#oint-settings .oint-mode button small{font-size:11px;font-weight:400;line-height:1.35}#oint-settings .oint-mode button.active{border-color:#c9d5cb;background:var(--card);color:var(--ink);box-shadow:0 2px 8px #18201e12}`;
     settingsHost._style = style;
     renderSettings(settingsHost);
     document.documentElement.appendChild(settingsHost);
@@ -817,17 +919,18 @@
   }
 
   function readSettingsForm() {
-    const next = clone(config);
-    next.enabled = settingsHost.querySelector('#oint-enabled').checked;
-    next.defaultAction = settingsHost.querySelector('#oint-default').value;
+    const nextGlobal = clone(config);
+    const nextProfiles = clone(policy.profiles);
+    const next = nextProfiles[config.activeMode];
+    nextGlobal.enabled = settingsHost.querySelector('#oint-enabled').checked;
+    nextGlobal.shortcuts = Object.fromEntries(Array.from(settingsHost.querySelectorAll('[data-shortcut]'), (el) => [el.dataset.shortcut, el.value.trim()]));
     next.behavior.skipSameDocument = settingsHost.querySelector('[data-behavior="skipSameDocument"]').checked;
     next.behavior.respectExistingTarget = settingsHost.querySelector('[data-behavior="respectExistingTarget"]').checked;
     next.behavior.skipInteractiveChildren = settingsHost.querySelector('[data-behavior="skipInteractiveChildren"]').checked;
-    next.shortcuts = Object.fromEntries(Array.from(settingsHost.querySelectorAll('[data-shortcut]'), (el) => [el.dataset.shortcut, el.value.trim()]));
     next.rules = Array.from(settingsHost.querySelectorAll('.oint-rule'), (card) => {
       const field = (name) => card.querySelector(`[data-field="${name}"]`);
       const patterns = (name) => field(name).value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
-      const old = config.rules.find((rule) => rule.id === card.dataset.id) || {};
+      const old = next.rules.find((rule) => rule.id === card.dataset.id) || {};
       const rule = {
         id: old.id || `rule:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
         name: field('name').value.trim(), enabled: field('enabled').checked,
@@ -840,7 +943,7 @@
       if (Object.keys(query).length) rule.query = query;
       return rule;
     });
-    return validateConfig(next);
+    return { global: validateGlobalConfig(nextGlobal), profiles: nextProfiles };
   }
 
   function showPolicyResult(sourceValue, destinationValue, output) {
@@ -848,7 +951,7 @@
       const source = new URL(sourceValue);
       const destination = new URL(destinationValue, source);
       if (!['http:', 'https:'].includes(source.protocol) || !['http:', 'https:'].includes(destination.protocol)) throw new Error('Only HTTP(S) URLs can be tested.');
-      const result = resolvePolicy(config, compiledRules, source, destination, sessionPaused);
+      const result = resolvePolicy(config, profile, compiledRules, source, destination, sessionPaused);
       output.textContent = `${result.action === 'new-tab' ? text('新标签打开', 'Open in new tab') : text('网站原生行为', 'Website default')} — ${result.reason}`;
     } catch (error) { output.textContent = error.message; }
   }
@@ -873,24 +976,38 @@
     }
     if (target.id === 'oint-add') {
       const rule = { id: `rule:${Date.now()}`, name: '', enabled: true, action: 'new-tab' };
-      const original = config;
       try {
-        const next = clone(config); next.rules.push(rule); config = validateConfig(next); renderSettings(settingsHost);
+        const draft = readSettingsForm();
+        draft.profiles[config.activeMode].rules.push(rule);
+        savePolicy(draft.global, draft.profiles);
+        renderSettings(settingsHost);
       } catch (error) { settingsHost.querySelector('#oint-status').textContent = error.message; }
-      finally { config = original; }
+      return;
+    }
+    if (target.dataset.mode) {
+      try {
+        const draft = readSettingsForm();
+        draft.global.activeMode = target.dataset.mode;
+        savePolicy(draft.global, draft.profiles);
+        renderSettings(settingsHost);
+        settingsHost.querySelector('#oint-status').textContent = text('已切换到另一套独立配置。', 'Switched to the other independent profile.');
+      } catch (error) { settingsHost.querySelector('#oint-status').textContent = error.message; }
       return;
     }
     if (target.id === 'oint-save') {
       try {
-        saveConfig(readSettingsForm());
-        settingsHost.querySelector('#oint-json').value = JSON.stringify(config, null, 2);
+        const draft = readSettingsForm();
+        savePolicy(draft.global, draft.profiles);
+        settingsHost.querySelector('#oint-json').value = JSON.stringify({ global: config, profiles: policy.profiles }, null, 2);
         settingsHost.querySelector('#oint-status').textContent = settingsHost._words.saved;
       } catch (error) { settingsHost.querySelector('#oint-status').textContent = error.message; }
       return;
     }
     if (target.id === 'oint-import') {
       try {
-        saveConfig(JSON.parse(settingsHost.querySelector('#oint-json').value));
+        const imported = JSON.parse(settingsHost.querySelector('#oint-json').value);
+        if (!imported || !imported.global || !imported.profiles) throw new Error('Expected {"global": ..., "profiles": ...}');
+        savePolicy(imported.global, imported.profiles);
         renderSettings(settingsHost);
         settingsHost.querySelector('#oint-status').textContent = settingsHost._words.importOk;
       } catch (error) { settingsHost.querySelector('#oint-status').textContent = error.message; }
@@ -898,7 +1015,7 @@
     }
     if (target.id === 'oint-copy') {
       const area = settingsHost.querySelector('#oint-json');
-      area.value = JSON.stringify(config, null, 2); area.focus(); area.select();
+      area.value = JSON.stringify({ global: config, profiles: policy.profiles }, null, 2); area.focus(); area.select();
       try { document.execCommand('copy'); settingsHost.querySelector('#oint-status').textContent = text('已复制；也可以直接从文本框复制。', 'Copied; you can also copy directly from the editor.'); }
       catch (_) { settingsHost.querySelector('#oint-status').textContent = text('请从文本框手动复制。', 'Copy from the editor manually.'); }
       return;
